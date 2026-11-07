@@ -1,12 +1,12 @@
 # C++ Kubernetes Demo
 
-An end-to-end C++ microservice delivery demonstration covering local compilation, static analysis, Debian packaging, Docker image creation, local Kubernetes deployment, and GitHub Actions automation.
+An end-to-end, learning-focused C++ microservice demonstration covering local compilation, static analysis, Debian packaging, Docker images, Kubernetes, Helm, Vault secret injection, and GitHub Actions automation.
 
-The application is intentionally small: it prints a startup banner and emits a heartbeat every five seconds. The small runtime makes the engineering lifecycle visible without hiding it behind application complexity.
+The application is intentionally small: it can read an API key from a file when `API_KEY_FILE` is set, then emits a heartbeat every five seconds. It never logs the key value.
 
 ## Summary
 
-We built an end-to-end, production-grade C++ microservice software engineering lifecycle. We started with host compilation on WSL 2, moved through quality checks and dual-packaging, deployed locally to a Kubernetes cluster, and automated the entire chain via GitHub Actions CI/CD.
+This repository demonstrates a C++ application lifecycle, from native compilation and packaging through local Kubernetes deployment and secret injection. The Vault dev-mode setup is for learning only and is not production-ready.
 
 The repository demonstrates these boundaries:
 
@@ -15,7 +15,9 @@ The repository demonstrates these boundaries:
 - **Quality checks:** Cppcheck and Clang-Tidy
 - **Debian packaging:** metadata in `packaging/debian/`, copied to `debian/` by CI before `dpkg-buildpackage`
 - **Container packaging:** multi-stage Docker build
-- **Kubernetes deployment:** `k8s/deployment.yaml`
+- **Kubernetes manifests:** `k8s/deployment.yaml` and `k8s/web.yaml`
+- **Helm chart:** `charts/cpp-k8s-demo/`
+- **Vault integration:** Vault Agent Injector and Kubernetes ServiceAccount authentication
 - **Automation:** `.github/workflows/ci.yml`
 
 ## Step-by-Step Learning Journey
@@ -44,8 +46,15 @@ cpp-k8s-demo/
 │   └── main.cpp
 ├── packaging/
 │   └── debian/
+├── charts/
+│   └── cpp-k8s-demo/
+│       ├── Chart.yaml
+│       ├── values.yaml
+│       └── templates/
+│           └── deployment.yaml
 ├── k8s/
-│   └── deployment.yaml
+│   ├── deployment.yaml
+│   └── web.yaml
 ├── Dockerfile
 └── .github/
     └── workflows/
@@ -181,80 +190,162 @@ docker rm -f cpp-k8s-demo-ci
 - **Dockerfile:** Defines the builder and runtime image stages.
 - **.dockerignore:** Removes unnecessary files from the Docker build context.
 
-### Step 4: Local Kubernetes Deployment with Kind
+### Step 4: Kubernetes Basics and Kind
 
-Kind runs Kubernetes nodes in containers and is useful for a fast local development loop.
+Kind creates a local Kubernetes cluster using Docker containers as nodes. A node runs Pods; a Pod contains one or more containers. A Deployment declares the desired number of Pod replicas and replaces Pods that stop. Namespaces group resources inside a cluster; they do not create separate clusters.
 
-#### Prerequisites
-
-Install or make available:
-
-- Docker
-- `kind`
-- `kubectl`
-
-Create a local cluster named `dev-cluster`:
+Create the local cluster and inspect its node:
 
 ```bash
-kind create cluster --name dev-cluster
+kind create cluster --name dev-cluster1
+kubectl get nodes
+kubectl get namespaces
 ```
 
-#### Build and Sideload the Image
+Create an application namespace:
 
-Build the image using the tag expected by the manifest, then load it directly into the Kind nodes:
+```bash
+kubectl create namespace cpp-app --dry-run=client -o yaml | kubectl apply -f -
+```
+
+The `k8s/web.yaml` example contains an Nginx Deployment and a ClusterIP Service. It can be applied independently to the `default` namespace:
+
+```bash
+kubectl apply -f k8s/web.yaml
+kubectl get deployments,services,pods
+kubectl delete -f k8s/web.yaml
+```
+
+Build the C++ image and load it into the Kind node. This avoids publishing it to a registry during local development:
 
 ```bash
 docker build -t cpp-k8s-demo:v1 .
-kind load docker-image cpp-k8s-demo:v1 --name dev-cluster
+kind load docker-image cpp-k8s-demo:v1 --name dev-cluster1
 ```
 
-This avoids pushing the image to an external registry during local development.
+The C++ Deployment manifest is configured for the `cpp-app` namespace and, in Step 6, will use Vault Agent injection. Do not apply it until Vault, its Kubernetes auth role, and the secret are configured.
 
-#### Deploy the Application
-
-Apply the deployment manifest:
+Useful inspection commands include:
 
 ```bash
-kubectl apply -f k8s/deployment.yaml
-kubectl get deployments
-kubectl get pods -l app=cpp-k8s-demo
+kubectl get deployments,pods -n cpp-app
+kubectl get pods -A
+kubectl describe pod <pod-name> -n cpp-app
+kubectl logs <pod-name> -n cpp-app
 ```
 
-The manifest creates two replicas and uses:
-
-- `imagePullPolicy: Never`, because the image was loaded directly into Kind.
-- CPU request: `50m`.
-- Memory request: `32Mi`.
-- CPU limit: `100m`.
-- Memory limit: `64Mi`.
-
-Stream the application heartbeats from both replicas:
-
-```bash
-kubectl logs -l app=cpp-k8s-demo -f
-```
-
-Inspect a deployment or pod when troubleshooting:
-
-```bash
-kubectl describe deployment cpp-k8s-demo
-kubectl describe pods -l app=cpp-k8s-demo
-```
-
-Remove the local resources when finished:
-
-```bash
-kubectl delete -f k8s/deployment.yaml
-kind delete cluster --name dev-cluster
-```
+`kubectl get pods -A` lists Pods across namespaces. Pod IPs are internal and can change when a Pod is replaced; a Service provides a stable network endpoint for applications that listen for network traffic.
 
 #### Tools Used
 
-- **Kind:** Creates a local Kubernetes cluster using Docker containers as nodes.
-- **kubectl:** Applies manifests, inspects resources, and streams pod logs.
-- **Kubernetes Deployment:** Maintains two application replicas and applies resource requests and limits.
+- **Kind:** Creates a local Kubernetes cluster with containerized nodes.
+- **kubectl:** Applies manifests and inspects cluster resources.
+- **Deployment:** Maintains the requested number of application Pods.
+- **Service:** Provides a stable endpoint for selected Pods.
 
-### Step 5: Automated CI/CD with GitHub Actions
+### Step 5: Helm Chart
+
+The chart under `charts/cpp-k8s-demo/` turns the C++ Deployment into a reusable package. `Chart.yaml` identifies the chart, `values.yaml` contains configurable defaults, and `templates/deployment.yaml` renders a Kubernetes Deployment from those values.
+
+Validate and preview the chart, then install it as a Helm release:
+
+```bash
+helm lint ./charts/cpp-k8s-demo
+helm template cpp-k8s-demo-helm ./charts/cpp-k8s-demo -n cpp-app
+helm upgrade --install cpp-k8s-demo-helm ./charts/cpp-k8s-demo -n cpp-app
+helm list -n cpp-app
+kubectl get deployments,pods -n cpp-app
+```
+
+`helm template` prints rendered YAML without changing the cluster. `helm upgrade --install` creates or updates the named release. The chart release creates a separate Deployment from the one managed directly by `k8s/deployment.yaml`, so installing both results in additional Pods. Remove the example release with:
+
+```bash
+helm uninstall cpp-k8s-demo-helm -n cpp-app
+```
+
+### Step 6: Vault Secret Injection
+
+This learning setup runs Vault in dev mode inside Kind. Dev mode uses an insecure root token and in-memory storage, so data is lost when Vault restarts. Use only fake secrets; never use this setup or token in production.
+
+Install the HashiCorp chart and wait for Vault and the Agent Injector Pods:
+
+```bash
+helm repo add hashicorp https://helm.releases.hashicorp.com
+helm repo update
+helm upgrade --install vault hashicorp/vault \
+  --namespace vault \
+  --create-namespace \
+  --set server.dev.enabled=true \
+  --set server.dev.devRootToken=learning-only-root
+kubectl get pods -n vault
+```
+
+Store a fake API key in Vault's KV engine:
+
+```bash
+kubectl exec -n vault vault-0 -- env VAULT_TOKEN=learning-only-root \
+  vault kv put secret/cpp-app api-key=learning-only-fake-key
+```
+
+Create a policy that permits reading only this KV v2 secret:
+
+```bash
+kubectl exec -i -n vault vault-0 -- env VAULT_TOKEN=learning-only-root \
+  vault policy write cpp-app-read - <<'EOF'
+path "secret/data/cpp-app" {
+  capabilities = ["read"]
+}
+EOF
+```
+
+Enable Kubernetes authentication and configure Vault to verify Pod ServiceAccount tokens through the Kubernetes API:
+
+```bash
+kubectl exec -n vault vault-0 -- env VAULT_TOKEN=learning-only-root \
+  vault auth enable kubernetes
+kubectl exec -n vault vault-0 -- env VAULT_TOKEN=learning-only-root sh -c \
+  'vault write auth/kubernetes/config \
+    kubernetes_host="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}" \
+    kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+kubectl exec -n vault vault-0 -- env VAULT_TOKEN=learning-only-root \
+  vault write auth/kubernetes/role/cpp-app \
+    bound_service_account_names=cpp-app \
+    bound_service_account_namespaces=cpp-app \
+    policies=cpp-app-read ttl=1h
+```
+
+Create the app ServiceAccount, build and load the current image, then apply the manifest:
+
+```bash
+kubectl create serviceaccount cpp-app -n cpp-app --dry-run=client -o yaml | kubectl apply -f -
+docker build -t cpp-k8s-demo:v1 .
+kind load docker-image cpp-k8s-demo:v1 --name dev-cluster1
+kubectl apply -f k8s/deployment.yaml
+kubectl rollout status deployment/cpp-k8s-demo -n cpp-app
+kubectl get pods -n cpp-app
+```
+
+The manifest annotates the Pod template for Vault Agent injection, selects the `cpp-app` role, and sets `API_KEY_FILE` to `/vault/secrets/api-key`. The Agent authenticates using the Pod's ServiceAccount, reads the permitted Vault path, and renders the value into a memory-backed shared volume. The C++ app reads the file at startup and logs only that the key was loaded, never its value. The Vault token remains with the Agent rather than being passed to the app.
+
+To verify the app started without printing the key:
+
+```bash
+kubectl logs deployment/cpp-k8s-demo -n cpp-app
+```
+
+The `API_KEY_FILE` setting is optional in local runs; without it, the application continues its heartbeat behavior without expecting a key file.
+
+#### Clean Up the Local Lab
+
+The following commands remove the Helm releases and the entire Kind cluster, including its local resources:
+
+```bash
+helm uninstall cpp-k8s-demo-helm -n cpp-app
+helm uninstall vault -n vault
+kind delete cluster --name dev-cluster1
+```
+
+### Step 7: Automated CI/CD with GitHub Actions
 
 `.github/workflows/ci.yml` runs only for pull requests targeting `main`. In GitHub terminology, this is the merge-request review and validation event. It does not run for ordinary pushes or tag pushes. The workflow performs the following sequence:
 
