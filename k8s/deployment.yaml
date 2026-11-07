@@ -2,10 +2,13 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: cpp-k8s-demo
+  namespace: cpp-app
   labels:
     app: cpp-k8s-demo
 spec:
+  # Keep two matching Pods running.
   replicas: 2
+  # This selector must match the labels on the Pod template.
   selector:
     matchLabels:
       app: cpp-k8s-demo
@@ -13,11 +16,25 @@ spec:
     metadata:
       labels:
         app: cpp-k8s-demo
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "cpp-app"
+        vault.hashicorp.com/agent-inject-secret-api-key: "secret/data/cpp-app"
+        vault.hashicorp.com/agent-inject-template-api-key: |
+          {{- with secret "secret/data/cpp-app" -}}
+          {{ index .Data.data "api-key" }}
+          {{- end }}
     spec:
+      serviceAccountName: cpp-app
       containers:
       - name: cpp-app
         image: cpp-k8s-demo:v1
+        env:
+        - name: API_KEY_FILE
+          value: /vault/secrets/api-key
+        # The image must already be loaded into the Kind node.
         imagePullPolicy: Never
+        # Requests guide scheduling; limits cap container resource use.
         resources:
           limits:
             cpu: "100m"

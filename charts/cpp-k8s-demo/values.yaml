@@ -1,0 +1,17 @@
+# Number of application Pods to keep running.
+replicaCount: 2
+
+# The image must already be loaded into the Kind node when using Never.
+image:
+  repository: cpp-k8s-demo
+  tag: v1
+  pullPolicy: Never
+
+# Resource requests guide scheduling; limits cap container usage.
+resources:
+  limits:
+    cpu: "100m"
+    memory: "64Mi"
+  requests:
+    cpu: "50m"
+    memory: "32Mi"
